@@ -9,3 +9,4 @@ jupyter>=1.0
 notebook>=7.0
 arch>=6.3
 shap>=0.44
+yfinance>=0.2.40

@@ -10,9 +10,9 @@ DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 CHART_DIR = OUTPUT_DIR / "charts"
 
-SPY_FILE = DATA_DIR / "spy5years.csv"
-TLT_FILE = DATA_DIR / "TLT_raw.csv"
-VIX_FILE = DATA_DIR / "VIX_raw.csv"
+SPY_FILE = DATA_DIR / "spy_full.csv"
+TLT_FILE = DATA_DIR / "tlt_full.csv"
+VIX_FILE = DATA_DIR / "vix_full.csv"
 
 MASTER_DATASET_FILE = OUTPUT_DIR / "master_dataset.csv"
 SPY_MODEL_DATASET_FILE = OUTPUT_DIR / "spy_model_dataset.csv"

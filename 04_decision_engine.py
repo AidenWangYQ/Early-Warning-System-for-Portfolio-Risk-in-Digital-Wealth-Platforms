@@ -1,7 +1,7 @@
 """
 04_decision_engine.py
 
-Decision engine for:
+Upgraded decision engine for:
 - SPY (growth / risky asset)
 - TLT (defensive / hedge asset)
 - Cash (capital preservation)
@@ -27,8 +27,12 @@ This script:
    - KPI summary on holdout
    - best parameters
 
-This is a portfolio construction / decision-engine script,
-NOT a predictive modelling script.
+Key upgrades vs earlier version:
+- momentum / trend overlay
+- relative attractiveness between SPY and TLT
+- gradual drawdown scaling
+- re-entry logic after stress eases
+- reduced cash-hoarding behaviour
 """
 
 from __future__ import annotations
@@ -53,10 +57,10 @@ from config import (
 )
 
 # ================================================================
-# FIXED ENGINE SETTINGS (STRUCTURE, NOT TUNED)
+# FIXED ENGINE SETTINGS
 # ================================================================
 
-# Business objective: keep realised portfolio risk near ~10% annualised
+# Business objective: keep realised portfolio risk around ~10% annualised
 TARGET_VOL = 0.10
 
 # Asset weight bounds
@@ -67,49 +71,53 @@ MAX_TLT_WEIGHT = 0.90
 MIN_TLT_WEIGHT = 0.00
 
 MIN_CASH_WEIGHT = 0.00
+MAX_CASH_WEIGHT = 0.60
 
-# IMPORTANT:
-# We now FIX these instead of tuning them, because over a short sample
-# they may not trigger often enough to tune reliably.
+# Stress controls
 STRESS_VOL_THRESHOLD = 0.20
-STRESS_MAX_SPY_WEIGHT = 0.50
+STRESS_MAX_SPY_WEIGHT = 0.55
 
+# Drawdown controls
 DRAWDOWN_TRIGGER = 0.10
-DRAWDOWN_SPY_MULTIPLIER = 0.85
 
-# Force at least some of the defensive bucket into TLT before hiding fully in cash
-# This avoids the engine becoming too cash-heavy.
-MIN_TLT_SHARE_OF_DEFENSIVE = 0.20
+# Defensive allocation preferences
+MIN_TLT_SHARE_OF_DEFENSIVE = 0.25
 
-# Whether to include 100% SPY benchmark
+# Re-entry / recovery control
+RECOVERY_VOL_BUFFER = 0.015
+
+# Optional benchmark
 INCLUDE_SPY_ONLY_BENCHMARK = True
 
 # Convert transaction cost from bps to decimal
 TRANSACTION_COST_RATE = TRANSACTION_COST_BPS / 10000.0
 
 # Validation / holdout split INSIDE predictions.csv
-# First 60% = validation for tuning
-# Last 40%  = holdout for final honest evaluation
 ENGINE_VALIDATION_RATIO = 0.60
 
-# Output files for tuning
+# Output files
 SEARCH_RESULTS_FILE = OUTPUT_DIR / "decision_engine_search_results.csv"
 BEST_ENGINE_PARAMS_FILE = OUTPUT_DIR / "decision_engine_best_params.json"
 
+SPY_UNCERTAINTY_PENALTY = 0.1
+TLT_UNCERTAINTY_PENALTY = 0.2
+REBALANCE_THRESHOLD = 0.05
+SMOOTHING_LAMBDA = 0.2
+MOMENTUM_STRENGTH = 0.2
+RELATIVE_STRENGTH = 0.3
+DRAWDOWN_SENSITIVITY = 0.5
+REENTRY_STRENGTH = 0.1
+CASH_PENALTY = 0.02
 
 # ================================================================
-# PARAMETER GRID (TUNE ONLY A FEW BEHAVIOURAL PARAMETERS)
+# PARAMETER GRID
 # ================================================================
-# These are engine-behaviour settings, not model hyperparameters.
 # Keep the grid small and interpretable.
 
 PARAM_GRID = {
-    "SPY_UNCERTAINTY_PENALTY": [0.10, 0.20, 0.30],
-    "TLT_UNCERTAINTY_PENALTY": [0.05, 0.15, 0.25],
-    "REBALANCE_THRESHOLD": [0.02, 0.05, 0.08],
-    "SMOOTHING_LAMBDA": [0.20, 0.30, 0.50],
+    "MOMENTUM_STRENGTH": [0.20, 0.30],
+    "CASH_PENALTY": [0.02, 0.05],
 }
-
 
 # ================================================================
 # HELPER FUNCTIONS
@@ -120,14 +128,20 @@ def clip(value: float, low: float, high: float) -> float:
     return float(np.clip(value, low, high))
 
 
+def safe_div(a: float, b: float, fallback: float = 0.0) -> float:
+    """Safe scalar division."""
+    if abs(b) <= 1e-12:
+        return fallback
+    return float(a / b)
+
+
 def normalise_weights(w_spy: float, w_tlt: float, w_cash: float) -> tuple[float, float, float]:
     """
     Ensure weights are non-negative and sum to 1.
-    This keeps the engine numerically safe after caps / floors / smoothing.
     """
     weights = np.array(
         [max(w_spy, 0.0), max(w_tlt, 0.0), max(w_cash, 0.0)],
-        dtype=float
+        dtype=float,
     )
     total = weights.sum()
 
@@ -135,6 +149,21 @@ def normalise_weights(w_spy: float, w_tlt: float, w_cash: float) -> tuple[float,
         return 0.0, 0.0, 1.0
 
     weights = weights / total
+
+    # Re-cap cash if needed and renormalise remaining assets
+    if weights[2] > MAX_CASH_WEIGHT:
+        excess = weights[2] - MAX_CASH_WEIGHT
+        weights[2] = MAX_CASH_WEIGHT
+
+        risky_total = weights[0] + weights[1]
+        if risky_total > 0:
+            weights[0] += excess * weights[0] / risky_total
+            weights[1] += excess * weights[1] / risky_total
+        else:
+            weights[1] += excess
+
+        weights = weights / weights.sum()
+
     return float(weights[0]), float(weights[1]), float(weights[2])
 
 
@@ -184,16 +213,10 @@ def compute_running_uncertainty_scale(history: list[float], current_value: float
     """
     Convert raw RF uncertainty into a rough 0-to-1 style scale using only
     information available up to the current day.
-
-    Why:
-    - RF uncertainty = std deviation across tree predictions
-    - larger value means trees disagree more
-    - the engine should become more conservative when uncertainty is high
     """
     hist = history + [current_value]
 
     if len(hist) < 5:
-        # Early days: not enough history yet
         return 0.5
 
     p90 = np.percentile(hist, 90)
@@ -201,14 +224,17 @@ def compute_running_uncertainty_scale(history: list[float], current_value: float
         return 0.0
 
     scaled = current_value / p90
-    return clip(scaled, 0.0, 1.0)
+    return clip(scaled, 0.0, 1.25)
 
 
-def split_validation_holdout(df: pd.DataFrame, ratio: float = ENGINE_VALIDATION_RATIO) -> tuple[pd.DataFrame, pd.DataFrame]:
+def split_validation_holdout(
+    df: pd.DataFrame,
+    ratio: float = ENGINE_VALIDATION_RATIO,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Chronologically split predictions into:
     - validation period for engine tuning
-    - later holdout period for honest final evaluation
+    - later holdout period for final evaluation
     """
     split_idx = int(len(df) * ratio)
 
@@ -222,12 +248,20 @@ def make_param_combinations(grid: dict) -> list[dict]:
     """Generate all parameter combinations from a small grid."""
     keys = list(grid.keys())
     values = list(grid.values())
-
     combos = []
+
     for vals in product(*values):
         combos.append(dict(zip(keys, vals)))
 
     return combos
+
+
+def squash_signal(x: float, scale: float = 1.0) -> float:
+    """
+    Smoothly squash signal into roughly [-1, 1].
+    Useful for momentum / attractiveness modifiers.
+    """
+    return float(np.tanh(scale * x))
 
 
 # ================================================================
@@ -288,11 +322,12 @@ def strategy_score(kpi_row: pd.Series) -> float:
 
     Higher is better.
 
-    Revised from the earlier version:
-    - still rewards low drawdown and target-vol adherence
-    - but now rewards Sharpe and return more strongly
-    - this reduces the chance that an overly defensive, cash-heavy
-      strategy gets selected just because it is "safe"
+    This version rewards:
+    - better Sharpe
+    - reasonable return
+    - lower drawdown
+    - closeness to target volatility
+    - lower turnover
     """
     vol_gap = abs(kpi_row["annualised_volatility"] - TARGET_VOL)
     mdd = abs(kpi_row["max_drawdown"])
@@ -300,7 +335,6 @@ def strategy_score(kpi_row: pd.Series) -> float:
     ann_ret = kpi_row["annualised_return"]
     turnover = kpi_row.get("avg_daily_turnover", 0.0)
 
-    # Safe handling of NaN
     if pd.isna(sharpe):
         sharpe = -999.0
     if pd.isna(ann_ret):
@@ -309,11 +343,11 @@ def strategy_score(kpi_row: pd.Series) -> float:
         turnover = 999.0
 
     score = (
-        - 3.0 * vol_gap
-        - 2.0 * mdd
-        + 3.0 * sharpe
-        + 2.0 * ann_ret
-        - 1.0 * turnover
+        -2.5 * vol_gap
+        -1.8 * mdd
+        +3.5 * sharpe
+        +2.5 * ann_ret
+        -0.8 * turnover
     )
     return float(score)
 
@@ -322,76 +356,167 @@ def strategy_score(kpi_row: pd.Series) -> float:
 # CORE DECISION LOGIC
 # ================================================================
 
-def compute_target_weights(
+def compute_momentum_signal(
+    spy_ma5_gap: float,
+    spy_ma20_gap: float,
+    spy_ret_lag1: float,
+    spy_ret_lag5: float,
+) -> float:
+    """
+    Build a simple direction / trend score for SPY using:
+    - short and medium MA gaps
+    - very recent return
+    - slightly longer lagged return
+
+    Positive = favourable trend
+    Negative = weak trend
+    """
+    raw = (
+        0.35 * spy_ma5_gap
+        + 0.35 * spy_ma20_gap
+        + 8.0 * spy_ret_lag1
+        + 4.0 * spy_ret_lag5
+    )
+    return squash_signal(raw, scale=3.0)
+
+
+def compute_relative_attractiveness(
     spy_pred_vol: float,
     tlt_pred_vol: float,
+    spy_unc_scaled: float,
+    tlt_unc_scaled: float,
+) -> float:
+    """
+    Relative attractiveness of SPY vs TLT using inverse risk adjusted by uncertainty.
+
+    Positive => SPY relatively more attractive
+    Negative => TLT relatively more attractive
+    """
+    spy_score = 1.0 / max(spy_pred_vol * (1.0 + spy_unc_scaled), 1e-8)
+    tlt_score = 1.0 / max(tlt_pred_vol * (1.0 + tlt_unc_scaled), 1e-8)
+
+    raw = safe_div(spy_score - tlt_score, spy_score + tlt_score, fallback=0.0)
+    return squash_signal(raw, scale=2.0)
+
+
+def compute_target_weights(
+    row: pd.Series,
     spy_unc_scaled: float,
     tlt_unc_scaled: float,
     current_drawdown: float,
     params: dict,
 ) -> tuple[float, float, float]:
     """
-    Convert today's predicted vol + uncertainty into target weights.
+    Convert today's predictions + state into target weights.
 
-    Layer 1: decide how much SPY exposure is affordable
-    Layer 2: allocate the defensive bucket between TLT and cash
-    Layer 3: apply uncertainty, stress, and drawdown overlays
+    Layers:
+    1) volatility targeting
+    2) uncertainty adjustment
+    3) relative attractiveness SPY vs TLT
+    4) momentum / trend overlay
+    5) stress and drawdown controls
+    6) re-entry logic
+    7) defensive bucket split between TLT and cash
     """
+    spy_pred_vol = float(row["spy_calibrated_rf_pred"])
+    tlt_pred_vol = float(row["tlt_calibrated_rf_pred"])
+
     spy_unc_penalty = params["SPY_UNCERTAINTY_PENALTY"]
     tlt_unc_penalty = params["TLT_UNCERTAINTY_PENALTY"]
+    momentum_strength = params["MOMENTUM_STRENGTH"]
+    relative_strength = params["RELATIVE_STRENGTH"]
+    drawdown_sensitivity = params["DRAWDOWN_SENSITIVITY"]
+    reentry_strength = params["REENTRY_STRENGTH"]
+    cash_penalty = params["CASH_PENALTY"]
 
     # ------------------------------------------------------------
-    # 1) Base SPY allocation from volatility targeting
+    # 1) Base SPY weight from volatility targeting
     # ------------------------------------------------------------
-    # If predicted SPY vol > target, reduce SPY weight.
-    # If predicted SPY vol < target, allow higher SPY exposure.
     spy_base = TARGET_VOL / max(spy_pred_vol, 1e-8)
     spy_base = clip(spy_base, MIN_SPY_WEIGHT, MAX_SPY_WEIGHT)
 
     # ------------------------------------------------------------
-    # 2) Reduce SPY exposure when RF uncertainty is high
+    # 2) Reduce SPY based on uncertainty
     # ------------------------------------------------------------
     spy_after_unc = spy_base * (1.0 - spy_unc_penalty * spy_unc_scaled)
     spy_after_unc = clip(spy_after_unc, MIN_SPY_WEIGHT, MAX_SPY_WEIGHT)
 
     # ------------------------------------------------------------
-    # 3) Stress overlay
+    # 3) Relative attractiveness between SPY and TLT
+    # ------------------------------------------------------------
+    rel_attr = compute_relative_attractiveness(
+        spy_pred_vol=spy_pred_vol,
+        tlt_pred_vol=tlt_pred_vol,
+        spy_unc_scaled=spy_unc_scaled,
+        tlt_unc_scaled=tlt_unc_scaled,
+    )
+
+    # Push SPY slightly up when relatively attractive, down otherwise
+    spy_after_relative = spy_after_unc * (1.0 + relative_strength * rel_attr)
+    spy_after_relative = clip(spy_after_relative, MIN_SPY_WEIGHT, MAX_SPY_WEIGHT)
+
+    # ------------------------------------------------------------
+    # 4) Momentum / trend overlay
+    # ------------------------------------------------------------
+    momentum_signal = compute_momentum_signal(
+        spy_ma5_gap=float(row.get("spy_price_ma5_gap", 0.0)),
+        spy_ma20_gap=float(row.get("spy_price_ma20_gap", 0.0)),
+        spy_ret_lag1=float(row.get("spy_ret_lag1", 0.0)),
+        spy_ret_lag5=float(row.get("spy_ret_lag5", 0.0)),
+    )
+
+    spy_after_momentum = spy_after_relative * (1.0 + momentum_strength * momentum_signal)
+    spy_after_momentum = clip(spy_after_momentum, MIN_SPY_WEIGHT, MAX_SPY_WEIGHT)
+
+    # ------------------------------------------------------------
+    # 5) Stress overlay
     # ------------------------------------------------------------
     if spy_pred_vol > STRESS_VOL_THRESHOLD:
-        spy_after_unc = min(spy_after_unc, STRESS_MAX_SPY_WEIGHT)
+        spy_after_momentum = min(spy_after_momentum, STRESS_MAX_SPY_WEIGHT)
 
     # ------------------------------------------------------------
-    # 4) Drawdown overlay
+    # 6) Gradual drawdown overlay
     # ------------------------------------------------------------
+    # current_drawdown is negative or zero
     if abs(current_drawdown) > DRAWDOWN_TRIGGER:
-        spy_after_unc *= DRAWDOWN_SPY_MULTIPLIER
-
-    spy_target = clip(spy_after_unc, MIN_SPY_WEIGHT, MAX_SPY_WEIGHT)
+        dd_excess = abs(current_drawdown) - DRAWDOWN_TRIGGER
+        dd_scale = 1.0 - drawdown_sensitivity * dd_excess
+        dd_scale = clip(dd_scale, 0.65, 1.0)
+        spy_after_momentum *= dd_scale
 
     # ------------------------------------------------------------
-    # 5) Defensive bucket = everything not in SPY
+    # 7) Re-entry logic
+    # ------------------------------------------------------------
+    # If predicted vol is near/below target and momentum is positive,
+    # allow some additional SPY exposure to participate in recovery.
+    if (spy_pred_vol < TARGET_VOL + RECOVERY_VOL_BUFFER) and (momentum_signal > 0):
+        reentry_boost = 1.0 + reentry_strength * momentum_signal
+        spy_after_momentum *= reentry_boost
+
+    spy_target = clip(spy_after_momentum, MIN_SPY_WEIGHT, MAX_SPY_WEIGHT)
+
+    # ------------------------------------------------------------
+    # 8) Defensive bucket between TLT and cash
     # ------------------------------------------------------------
     defensive_bucket = 1.0 - spy_target
 
-    # ------------------------------------------------------------
-    # 6) Allocate defensive bucket between TLT and cash
-    # ------------------------------------------------------------
-    # TLT is preferred when:
-    # - its predicted risk is low relative to SPY
-    # - its uncertainty is not too high
-    #
-    # This baseline intentionally tries to use TLT before hiding in cash.
-    rel_tlt_risk = tlt_pred_vol / max(spy_pred_vol, 1e-8)
+    # TLT share higher when:
+    # - TLT predicted vol is not too high vs SPY
+    # - TLT uncertainty is manageable
+    rel_tlt_risk = safe_div(tlt_pred_vol, spy_pred_vol, fallback=1.0)
 
-    base_tlt_share = 1.2 - rel_tlt_risk
-    base_tlt_share = clip(base_tlt_share, 0.30, 0.90)
+    base_tlt_share = 1.10 - 0.55 * rel_tlt_risk
+    base_tlt_share = clip(base_tlt_share, 0.25, 0.90)
 
+    # Apply TLT uncertainty penalty
     tlt_share_after_unc = base_tlt_share * (1.0 - tlt_unc_penalty * tlt_unc_scaled)
     tlt_share_after_unc = clip(tlt_share_after_unc, 0.0, 1.0)
 
-    # Mild floor: at least some of the defensive bucket should go to TLT
-    # unless the bucket itself is near zero.
+    # Mild floor so defensive allocation does not go too aggressively into cash
     tlt_share_after_unc = max(tlt_share_after_unc, MIN_TLT_SHARE_OF_DEFENSIVE)
+
+    # Cash penalty = prefer staying invested rather than hiding in cash too much
+    tlt_share_after_unc = clip(tlt_share_after_unc + cash_penalty, 0.0, 1.0)
 
     w_tlt_target = defensive_bucket * tlt_share_after_unc
     w_tlt_target = clip(w_tlt_target, MIN_TLT_WEIGHT, MAX_TLT_WEIGHT)
@@ -427,7 +552,6 @@ def apply_rebalancing_rules(
         abs(tgt_cash - prev_cash),
     )
 
-    # If desired change is too small, do nothing
     if max_change < rebalance_threshold:
         new_weights = (prev_spy, prev_tlt, prev_cash)
     else:
@@ -437,9 +561,9 @@ def apply_rebalancing_rules(
         new_weights = normalise_weights(new_spy, new_tlt, new_cash)
 
     turnover = 0.5 * (
-        abs(new_weights[0] - prev_spy) +
-        abs(new_weights[1] - prev_tlt) +
-        abs(new_weights[2] - prev_cash)
+        abs(new_weights[0] - prev_spy)
+        + abs(new_weights[1] - prev_tlt)
+        + abs(new_weights[2] - prev_cash)
     )
 
     return new_weights[0], new_weights[1], new_weights[2], float(turnover)
@@ -473,10 +597,21 @@ def run_dynamic_strategy(pred_df: pd.DataFrame, params: dict) -> pd.DataFrame:
     if missing:
         raise ValueError(f"predictions.csv is missing required columns: {missing}")
 
-    # Start from the static benchmark weights
+    # Optional columns used for momentum overlay
+    optional_cols = [
+        "spy_price_ma5_gap",
+        "spy_price_ma20_gap",
+        "spy_ret_lag1",
+        "spy_ret_lag5",
+    ]
+    for col in optional_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # Start from static benchmark weights
     w_spy = STATIC_SPY_WEIGHT
     w_tlt = STATIC_TLT_WEIGHT
-    w_cash = 0.0
+    w_cash = max(0.0, 1.0 - w_spy - w_tlt)
 
     portfolio_value = 1.0
     running_peak = 1.0
@@ -487,8 +622,6 @@ def run_dynamic_strategy(pred_df: pd.DataFrame, params: dict) -> pd.DataFrame:
     records = []
 
     for _, row in df.iterrows():
-        spy_pred = float(row["spy_calibrated_rf_pred"])
-        tlt_pred = float(row["tlt_calibrated_rf_pred"])
         spy_unc = float(row["spy_rf_uncertainty"])
         tlt_unc = float(row["tlt_rf_uncertainty"])
 
@@ -498,8 +631,7 @@ def run_dynamic_strategy(pred_df: pd.DataFrame, params: dict) -> pd.DataFrame:
         current_drawdown = (portfolio_value / running_peak) - 1.0
 
         tgt_spy, tgt_tlt, tgt_cash = compute_target_weights(
-            spy_pred_vol=spy_pred,
-            tlt_pred_vol=tlt_pred,
+            row=row,
             spy_unc_scaled=spy_unc_scaled,
             tlt_unc_scaled=tlt_unc_scaled,
             current_drawdown=current_drawdown,
@@ -512,55 +644,45 @@ def run_dynamic_strategy(pred_df: pd.DataFrame, params: dict) -> pd.DataFrame:
             params=params,
         )
 
-        trading_cost = turnover * TRANSACTION_COST_RATE
+        transaction_cost = turnover * TRANSACTION_COST_RATE
 
-        next_spy_ret = float(row["spy_next_day_return"])
-        next_tlt_ret = float(row["tlt_next_day_return"])
-
-        portfolio_return_gross = (
-            new_spy * next_spy_ret +
-            new_tlt * next_tlt_ret +
-            new_cash * 0.0
+        gross_return = (
+            new_spy * float(row["spy_next_day_return"])
+            + new_tlt * float(row["tlt_next_day_return"])
+            + new_cash * 0.0
         )
-        portfolio_return_net = portfolio_return_gross - trading_cost
 
-        portfolio_value *= (1.0 + portfolio_return_net)
+        net_return = gross_return - transaction_cost
+
+        portfolio_value *= (1.0 + net_return)
         running_peak = max(running_peak, portfolio_value)
-        new_drawdown = (portfolio_value / running_peak) - 1.0
+        next_drawdown = (portfolio_value / running_peak) - 1.0
 
-        records.append({
-            "date": row["date"],
+        records.append(
+            {
+                "date": row["date"],
+                "spy_calibrated_rf_pred": float(row["spy_calibrated_rf_pred"]),
+                "tlt_calibrated_rf_pred": float(row["tlt_calibrated_rf_pred"]),
+                "spy_rf_uncertainty": spy_unc,
+                "tlt_rf_uncertainty": tlt_unc,
+                "spy_unc_scaled": spy_unc_scaled,
+                "tlt_unc_scaled": tlt_unc_scaled,
+                "spy_price_ma5_gap": float(row["spy_price_ma5_gap"]),
+                "spy_price_ma20_gap": float(row["spy_price_ma20_gap"]),
+                "spy_ret_lag1": float(row["spy_ret_lag1"]),
+                "spy_ret_lag5": float(row["spy_ret_lag5"]),
+                "w_spy": new_spy,
+                "w_tlt": new_tlt,
+                "w_cash": new_cash,
+                "turnover": turnover,
+                "transaction_cost": transaction_cost,
+                "gross_return": gross_return,
+                "net_return": net_return,
+                "portfolio_value": portfolio_value,
+                "drawdown": next_drawdown,
+            }
+        )
 
-            # Signals
-            "spy_pred_vol": spy_pred,
-            "tlt_pred_vol": tlt_pred,
-            "spy_uncertainty_raw": spy_unc,
-            "tlt_uncertainty_raw": tlt_unc,
-            "spy_uncertainty_scaled": spy_unc_scaled,
-            "tlt_uncertainty_scaled": tlt_unc_scaled,
-
-            # Targets
-            "target_spy_weight": tgt_spy,
-            "target_tlt_weight": tgt_tlt,
-            "target_cash_weight": tgt_cash,
-
-            # Actual weights after rebalance logic
-            "dyn_spy_weight": new_spy,
-            "dyn_tlt_weight": new_tlt,
-            "dyn_cash_weight": new_cash,
-
-            # Trading + performance
-            "dyn_turnover": turnover,
-            "dyn_trading_cost": trading_cost,
-            "spy_next_day_return": next_spy_ret,
-            "tlt_next_day_return": next_tlt_ret,
-            "dyn_return_gross": portfolio_return_gross,
-            "dyn_return_net": portfolio_return_net,
-            "dyn_portfolio_value": portfolio_value,
-            "dyn_drawdown": new_drawdown,
-        })
-
-        # Roll forward
         w_spy, w_tlt, w_cash = new_spy, new_tlt, new_cash
         spy_unc_history.append(spy_unc)
         tlt_unc_history.append(tlt_unc)
@@ -568,99 +690,230 @@ def run_dynamic_strategy(pred_df: pd.DataFrame, params: dict) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def add_benchmarks(results_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add benchmark strategies to the daily results dataframe:
-    1. Static 60/40 SPY/TLT
-    2. Optional 100% SPY
-    """
-    df = results_df.copy()
+# ================================================================
+# BENCHMARKS
+# ================================================================
 
-    # Static 60/40 benchmark
-    static_value = 1.0
-    static_values = []
-    static_returns = []
+def run_static_6040_benchmark(pred_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Static 60/40 benchmark using next-day SPY and TLT returns.
+    """
+    df = pred_df.copy().sort_values("date").reset_index(drop=True)
+
+    w_spy = STATIC_SPY_WEIGHT
+    w_tlt = STATIC_TLT_WEIGHT
+    w_cash = max(0.0, 1.0 - w_spy - w_tlt)
+
+    portfolio_value = 1.0
+    running_peak = 1.0
+    records = []
 
     for _, row in df.iterrows():
-        r = (
-            STATIC_SPY_WEIGHT * row["spy_next_day_return"] +
-            STATIC_TLT_WEIGHT * row["tlt_next_day_return"]
+        gross_return = (
+            w_spy * float(row["spy_next_day_return"])
+            + w_tlt * float(row["tlt_next_day_return"])
+            + w_cash * 0.0
         )
-        static_value *= (1.0 + r)
-        static_returns.append(r)
-        static_values.append(static_value)
+        net_return = gross_return
+        portfolio_value *= (1.0 + net_return)
+        running_peak = max(running_peak, portfolio_value)
+        dd = (portfolio_value / running_peak) - 1.0
 
-    df["static_return_net"] = static_returns
-    df["static_portfolio_value"] = static_values
-    static_peak = df["static_portfolio_value"].cummax()
-    df["static_drawdown"] = (df["static_portfolio_value"] / static_peak) - 1.0
+        records.append(
+            {
+                "date": row["date"],
+                "w_spy": w_spy,
+                "w_tlt": w_tlt,
+                "w_cash": w_cash,
+                "turnover": 0.0,
+                "transaction_cost": 0.0,
+                "gross_return": gross_return,
+                "net_return": net_return,
+                "portfolio_value": portfolio_value,
+                "drawdown": dd,
+            }
+        )
 
-    # 100% SPY benchmark
-    if INCLUDE_SPY_ONLY_BENCHMARK:
-        spy_only_value = 1.0
-        spy_only_values = []
-        spy_only_returns = []
+    return pd.DataFrame(records)
 
-        for _, row in df.iterrows():
-            r = row["spy_next_day_return"]
-            spy_only_value *= (1.0 + r)
-            spy_only_returns.append(r)
-            spy_only_values.append(spy_only_value)
 
-        df["spy_only_return_net"] = spy_only_returns
-        df["spy_only_portfolio_value"] = spy_only_values
-        spy_only_peak = df["spy_only_portfolio_value"].cummax()
-        df["spy_only_drawdown"] = (df["spy_only_portfolio_value"] / spy_only_peak) - 1.0
+def run_static_spy_benchmark(pred_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    100% SPY benchmark.
+    """
+    df = pred_df.copy().sort_values("date").reset_index(drop=True)
 
-    return df
+    portfolio_value = 1.0
+    running_peak = 1.0
+    records = []
+
+    for _, row in df.iterrows():
+        gross_return = float(row["spy_next_day_return"])
+        net_return = gross_return
+        portfolio_value *= (1.0 + net_return)
+        running_peak = max(running_peak, portfolio_value)
+        dd = (portfolio_value / running_peak) - 1.0
+
+        records.append(
+            {
+                "date": row["date"],
+                "w_spy": 1.0,
+                "w_tlt": 0.0,
+                "w_cash": 0.0,
+                "turnover": 0.0,
+                "transaction_cost": 0.0,
+                "gross_return": gross_return,
+                "net_return": net_return,
+                "portfolio_value": portfolio_value,
+                "drawdown": dd,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def run_naive_vol_target_benchmark(pred_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Simple benchmark:
+    - weight SPY by target_vol / predicted_vol
+    - put the remainder into TLT
+    - no uncertainty, no momentum, no drawdown overlay
+    - partial cap for realism
+
+    This is useful because it shows whether the full decision engine
+    adds value beyond a much simpler dynamic rule.
+    """
+    df = pred_df.copy().sort_values("date").reset_index(drop=True)
+
+    portfolio_value = 1.0
+    running_peak = 1.0
+
+    prev_spy, prev_tlt, prev_cash = STATIC_SPY_WEIGHT, STATIC_TLT_WEIGHT, max(0.0, 1.0 - STATIC_SPY_WEIGHT - STATIC_TLT_WEIGHT)
+    records = []
+
+    for _, row in df.iterrows():
+        spy_pred = float(row["spy_calibrated_rf_pred"])
+
+        w_spy = clip(TARGET_VOL / max(spy_pred, 1e-8), 0.0, 0.90)
+        w_tlt = 1.0 - w_spy
+        w_cash = 0.0
+        w_spy, w_tlt, w_cash = normalise_weights(w_spy, w_tlt, w_cash)
+
+        turnover = 0.5 * (
+            abs(w_spy - prev_spy)
+            + abs(w_tlt - prev_tlt)
+            + abs(w_cash - prev_cash)
+        )
+        transaction_cost = turnover * TRANSACTION_COST_RATE
+
+        gross_return = (
+            w_spy * float(row["spy_next_day_return"])
+            + w_tlt * float(row["tlt_next_day_return"])
+        )
+        net_return = gross_return - transaction_cost
+
+        portfolio_value *= (1.0 + net_return)
+        running_peak = max(running_peak, portfolio_value)
+        dd = (portfolio_value / running_peak) - 1.0
+
+        records.append(
+            {
+                "date": row["date"],
+                "w_spy": w_spy,
+                "w_tlt": w_tlt,
+                "w_cash": w_cash,
+                "turnover": turnover,
+                "transaction_cost": transaction_cost,
+                "gross_return": gross_return,
+                "net_return": net_return,
+                "portfolio_value": portfolio_value,
+                "drawdown": dd,
+            }
+        )
+
+        prev_spy, prev_tlt, prev_cash = w_spy, w_tlt, w_cash
+
+    return pd.DataFrame(records)
 
 
 # ================================================================
-# PARAMETER SEARCH
+# ENGINE TUNING
 # ================================================================
 
-def run_parameter_search(validation_df: pd.DataFrame, param_grid: dict) -> pd.DataFrame:
+def tune_engine(validation_df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     """
-    Run a structured grid search on the validation segment only.
+    Grid-search only the selected behavioural parameters on validation period,
+    while keeping all other engine settings fixed at their default values.
     """
-    combinations = make_param_combinations(param_grid)
+    combos = make_param_combinations(PARAM_GRID)
     results = []
 
-    print("=" * 60)
-    print("RUNNING DECISION ENGINE PARAMETER SEARCH")
-    print("=" * 60)
-    print(f"Validation rows: {len(validation_df)}")
-    print(f"Parameter combinations: {len(combinations)}")
+    # Full default parameter set
+    DEFAULT_PARAMS = {
+        "SPY_UNCERTAINTY_PENALTY": SPY_UNCERTAINTY_PENALTY,
+        "TLT_UNCERTAINTY_PENALTY": TLT_UNCERTAINTY_PENALTY,
+        "REBALANCE_THRESHOLD": REBALANCE_THRESHOLD,
+        "SMOOTHING_LAMBDA": SMOOTHING_LAMBDA,
+        "MOMENTUM_STRENGTH": MOMENTUM_STRENGTH,
+        "RELATIVE_STRENGTH": RELATIVE_STRENGTH,
+        "DRAWDOWN_SENSITIVITY": DRAWDOWN_SENSITIVITY,
+        "REENTRY_STRENGTH": REENTRY_STRENGTH,
+        "CASH_PENALTY": CASH_PENALTY,
+    }
 
-    for i, params in enumerate(combinations, start=1):
-        daily = run_dynamic_strategy(validation_df, params=params)
+    print(f"\nTuning decision engine over {len(combos)} parameter combinations...")
 
-        kpis = compute_strategy_kpis(
-            df=daily,
-            strategy_name="Dynamic Decision Engine (Validation)",
-            return_col="dyn_return_net",
-            value_col="dyn_portfolio_value",
-            turnover_col="dyn_turnover",
-            cost_col="dyn_trading_cost",
-            spy_weight_col="dyn_spy_weight",
-            tlt_weight_col="dyn_tlt_weight",
-            cash_weight_col="dyn_cash_weight",
-        )
+    for i, tuned_params in enumerate(combos, start=1):
+        if i % 50 == 0 or i == 1 or i == len(combos):
+            print(f"  Progress: {i}/{len(combos)}")
 
-        score = strategy_score(pd.Series(kpis))
+        # Merge tuned params into full default param set
+        params = DEFAULT_PARAMS.copy()
+        params.update(tuned_params)
 
-        row = {
-            **params,
-            **kpis,
-            "score": score,
-        }
-        results.append(row)
+        try:
+            strat_df = run_dynamic_strategy(validation_df, params)
 
-        if i % 20 == 0 or i == len(combinations):
-            print(f"  Completed {i}/{len(combinations)} combinations")
+            kpis = compute_strategy_kpis(
+                strat_df,
+                strategy_name="dynamic_validation",
+                return_col="net_return",
+                value_col="portfolio_value",
+                turnover_col="turnover",
+                cost_col="transaction_cost",
+                spy_weight_col="w_spy",
+                tlt_weight_col="w_tlt",
+                cash_weight_col="w_cash",
+            )
 
-    search_df = pd.DataFrame(results).sort_values("score", ascending=False).reset_index(drop=True)
-    return search_df
+            score = strategy_score(pd.Series(kpis))
+
+            # Save both tuned values and KPI outputs
+            result_row = dict(params)
+            result_row.update(kpis)
+            result_row["score"] = score
+            results.append(result_row)
+
+        except Exception as e:
+            result_row = dict(params)
+            result_row["strategy"] = "dynamic_validation"
+            result_row["score"] = -999999.0
+            result_row["error"] = str(e)
+            results.append(result_row)
+
+    results_df = pd.DataFrame(results).sort_values("score", ascending=False).reset_index(drop=True)
+
+    if results_df.empty:
+        raise ValueError("No tuning results generated.")
+
+    best_row = results_df.iloc[0]
+
+    # Reconstruct full best parameter set
+    best_params = DEFAULT_PARAMS.copy()
+    for k in PARAM_GRID.keys():
+        best_params[k] = best_row[k]
+
+    return best_params, results_df
 
 
 # ================================================================
@@ -670,135 +923,145 @@ def run_parameter_search(validation_df: pd.DataFrame, param_grid: dict) -> pd.Da
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------
-    # 1) Load predictions from modelling stage
-    # ------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("UPGRADED DECISION ENGINE")
+    print("=" * 70)
+
     pred_df = pd.read_csv(PREDICTIONS_FILE, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
 
-    # ------------------------------------------------------------
-    # 2) Split into validation and holdout periods
-    # ------------------------------------------------------------
-    validation_df, holdout_df = split_validation_holdout(pred_df, ratio=ENGINE_VALIDATION_RATIO)
+    print(f"Loaded predictions: {len(pred_df)} rows from {PREDICTIONS_FILE}")
 
-    print("=" * 60)
-    print("DECISION ENGINE DATA SPLIT")
-    print("=" * 60)
-    print(f"Total rows:       {len(pred_df)}")
-    print(f"Validation rows:  {len(validation_df)}")
-    print(f"Holdout rows:     {len(holdout_df)}")
-    print(f"Validation dates: {validation_df['date'].min().date()} -> {validation_df['date'].max().date()}")
-    print(f"Holdout dates:    {holdout_df['date'].min().date()} -> {holdout_df['date'].max().date()}")
+    validation_df, holdout_df = split_validation_holdout(pred_df)
+
+    print(f"Validation rows: {len(validation_df)}")
+    print(f"Holdout rows:    {len(holdout_df)}")
 
     # ------------------------------------------------------------
-    # 3) Parameter search on validation
+    # Tune on validation
     # ------------------------------------------------------------
-    search_df = run_parameter_search(validation_df, PARAM_GRID)
-    search_df.to_csv(SEARCH_RESULTS_FILE, index=False)
+    best_params, search_results_df = tune_engine(validation_df)
 
-    best_params = {
-        key: search_df.loc[0, key]
-        for key in PARAM_GRID.keys()
-    }
-
-    with open(BEST_ENGINE_PARAMS_FILE, "w") as f:
-        json.dump(best_params, f, indent=2)
-
-    print("\nTop 10 parameter sets on validation:")
-    display_cols = list(PARAM_GRID.keys()) + [
-        "score",
-        "annualised_return",
-        "annualised_volatility",
-        "target_vol_gap",
-        "sharpe_ratio",
-        "max_drawdown",
-        "avg_daily_turnover",
-        "avg_spy_weight",
-        "avg_tlt_weight",
-        "avg_cash_weight",
-    ]
-    print(search_df[display_cols].head(10).round(4).to_string(index=False))
-
-    print("\nBest parameters selected from validation:")
+    print("\nBest engine parameters:")
     for k, v in best_params.items():
         print(f"  {k}: {v}")
 
-    # ------------------------------------------------------------
-    # 4) Final honest evaluation on later unseen holdout
-    # ------------------------------------------------------------
-    holdout_daily = run_dynamic_strategy(holdout_df, params=best_params)
-    holdout_daily = add_benchmarks(holdout_daily)
+    search_results_df.to_csv(SEARCH_RESULTS_FILE, index=False)
+    with open(BEST_ENGINE_PARAMS_FILE, "w") as f:
+        json.dump(best_params, f, indent=2)
 
     # ------------------------------------------------------------
-    # 5) KPI comparison on holdout
+    # Evaluate on holdout
     # ------------------------------------------------------------
-    kpis = []
+    print("\nRunning final holdout evaluation...")
 
-    # Dynamic strategy
-    kpis.append(
+    dynamic_df = run_dynamic_strategy(holdout_df, best_params)
+    static_6040_df = run_static_6040_benchmark(holdout_df)
+    naive_vol_df = run_naive_vol_target_benchmark(holdout_df)
+
+    kpi_rows = []
+
+    kpi_rows.append(
         compute_strategy_kpis(
-            df=holdout_daily,
-            strategy_name="Dynamic Decision Engine",
-            return_col="dyn_return_net",
-            value_col="dyn_portfolio_value",
-            turnover_col="dyn_turnover",
-            cost_col="dyn_trading_cost",
-            spy_weight_col="dyn_spy_weight",
-            tlt_weight_col="dyn_tlt_weight",
-            cash_weight_col="dyn_cash_weight",
+            dynamic_df,
+            strategy_name="Dynamic Strategy",
+            return_col="net_return",
+            value_col="portfolio_value",
+            turnover_col="turnover",
+            cost_col="transaction_cost",
+            spy_weight_col="w_spy",
+            tlt_weight_col="w_tlt",
+            cash_weight_col="w_cash",
         )
     )
 
-    # Static 60/40 benchmark
-    kpis.append(
+    kpi_rows.append(
         compute_strategy_kpis(
-            df=holdout_daily,
+            static_6040_df,
             strategy_name="Static 60/40",
-            return_col="static_return_net",
-            value_col="static_portfolio_value",
+            return_col="net_return",
+            value_col="portfolio_value",
+            turnover_col="turnover",
+            cost_col="transaction_cost",
+            spy_weight_col="w_spy",
+            tlt_weight_col="w_tlt",
+            cash_weight_col="w_cash",
         )
     )
 
-    # 100% SPY benchmark
+    kpi_rows.append(
+        compute_strategy_kpis(
+            naive_vol_df,
+            strategy_name="Naive Vol Target",
+            return_col="net_return",
+            value_col="portfolio_value",
+            turnover_col="turnover",
+            cost_col="transaction_cost",
+            spy_weight_col="w_spy",
+            tlt_weight_col="w_tlt",
+            cash_weight_col="w_cash",
+        )
+    )
+
     if INCLUDE_SPY_ONLY_BENCHMARK:
-        kpis.append(
+        spy_df = run_static_spy_benchmark(holdout_df)
+        kpi_rows.append(
             compute_strategy_kpis(
-                df=holdout_daily,
+                spy_df,
                 strategy_name="100% SPY",
-                return_col="spy_only_return_net",
-                value_col="spy_only_portfolio_value",
+                return_col="net_return",
+                value_col="portfolio_value",
+                turnover_col="turnover",
+                cost_col="transaction_cost",
+                spy_weight_col="w_spy",
+                tlt_weight_col="w_tlt",
+                cash_weight_col="w_cash",
             )
         )
+    else:
+        spy_df = None
 
-    kpi_df = pd.DataFrame(kpis)
-
-    # ------------------------------------------------------------
-    # 6) Save outputs
-    # ------------------------------------------------------------
-    holdout_daily.to_csv(PORTFOLIO_RESULTS_FILE, index=False)
-    kpi_df.to_csv(PORTFOLIO_KPIS_FILE, index=False)
+    kpis_df = pd.DataFrame(kpi_rows)
 
     # ------------------------------------------------------------
-    # 7) Print final summary
+    # Save outputs
     # ------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("DECISION ENGINE COMPLETE")
-    print("=" * 60)
-    print(f"Saved search results:  {SEARCH_RESULTS_FILE}")
-    print(f"Saved best params:     {BEST_ENGINE_PARAMS_FILE}")
-    print(f"Saved daily results:   {PORTFOLIO_RESULTS_FILE}")
-    print(f"Saved KPI summary:     {PORTFOLIO_KPIS_FILE}")
+    output_frames = []
 
-    print("\nFinal KPI summary on holdout period:")
-    final_display_cols = [
-        "strategy",
-        "annualised_return",
-        "annualised_volatility",
-        "target_vol_gap",
-        "sharpe_ratio",
-        "max_drawdown",
-        "ending_value",
-    ]
-    print(kpi_df[final_display_cols].round(4).to_string(index=False))
+    dyn_out = dynamic_df.copy()
+    dyn_out["strategy"] = "Dynamic Strategy"
+    output_frames.append(dyn_out)
+
+    s6040_out = static_6040_df.copy()
+    s6040_out["strategy"] = "Static 60/40"
+    output_frames.append(s6040_out)
+
+    naive_out = naive_vol_df.copy()
+    naive_out["strategy"] = "Naive Vol Target"
+    output_frames.append(naive_out)
+
+    if spy_df is not None:
+        spy_out = spy_df.copy()
+        spy_out["strategy"] = "100% SPY"
+        output_frames.append(spy_out)
+
+    portfolio_results_df = pd.concat(output_frames, ignore_index=True)
+
+    portfolio_results_df.to_csv(PORTFOLIO_RESULTS_FILE, index=False)
+    kpis_df.to_csv(PORTFOLIO_KPIS_FILE, index=False)
+
+    # ------------------------------------------------------------
+    # Print summary
+    # ------------------------------------------------------------
+    print("\nHoldout KPI summary:")
+    print(kpis_df.round(4).to_string(index=False))
+
+    print(f"\nSaved:")
+    print(f"  Search results:    {SEARCH_RESULTS_FILE}")
+    print(f"  Best params:       {BEST_ENGINE_PARAMS_FILE}")
+    print(f"  Portfolio results: {PORTFOLIO_RESULTS_FILE}")
+    print(f"  Portfolio KPIs:    {PORTFOLIO_KPIS_FILE}")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":

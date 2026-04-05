@@ -3,15 +3,9 @@ from __future__ import annotations
 # ================================================================
 # 05_evaluation_and_charts.py (ANNOTATED VERSION)
 # ================================================================
-# Purpose of this file:
-# This script turns your result CSVs into presentation-ready charts and summary
+# This script turns result CSVs into presentation-ready charts and summary
 # tables.
 #
-# In other words:
-# - 03_modeling.py creates model predictions and model metrics
-# - 04_decision_engine.py creates strategy backtests and KPI outputs
-# - 05_evaluation_and_charts.py packages all of that into visuals for report,
-#   slides, and dashboard-like communication
 #
 # Main workflow:
 # 1. Load model_metrics.csv, warning_metrics.csv, predictions.csv,

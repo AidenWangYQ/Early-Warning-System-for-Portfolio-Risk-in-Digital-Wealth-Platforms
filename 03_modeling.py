@@ -1,5 +1,5 @@
 """
-03_modeling.py  (modified by Tzu Wei)
+03_modeling.py  
 
 Changes from original:
 - Added RF + GARCH stacking with linear meta-learner
@@ -16,8 +16,6 @@ Models included:
 - Stacked (RF + GARCH, constrained weight optimization)
 - Regime-Switch (calibrated RF normally, GARCH when models disagree)
 - Calibrated RF (isotonic regression on RF output)  <- FINAL BEST MODEL
-
-All other logic (features, target, split) unchanged from Aiden's version.
 """
 
 from __future__ import annotations

@@ -35,7 +35,7 @@ Data → Feature Engineering → Modeling → Decision Engine → Evaluation & C
   - SPY (Equities)
   - TLT (Bonds)
   - VIX (Market volatility proxy)
-- Source: Yahoo Finance via `yfinance` :contentReference[oaicite:0]{index=0}
+- Source: Yahoo Finance via `yfinance` 
 
 ---
 
@@ -49,7 +49,7 @@ From the master dataset, the system builds predictive features such as:
 - SPY–TLT correlation (regime detection)
 
 Target:
-- **Next 5-day realised volatility (annualised)** :contentReference[oaicite:1]{index=1}
+- **Next 5-day realised volatility (annualised)** 
 
 ---
 
@@ -70,7 +70,7 @@ Models implemented:
 
 Key improvement:
 - **Out-of-fold stacking** avoids data leakage
-- **GARCH complements RF’s extrapolation limits** :contentReference[oaicite:2]{index=2}
+- **GARCH complements RF’s extrapolation limits** 
 
 ---
 
@@ -106,7 +106,7 @@ The decision engine converts forecasts into portfolio weights across:
 7. **Re-entry Mechanism**
    - Gradually increase exposure when conditions improve
 
-This creates a **realistic, institutional-style allocation system**, rather than a simple rule-based model :contentReference[oaicite:3]{index=3}
+This creates a **realistic, institutional-style allocation system**, rather than a simple rule-based model.
 
 ---
 
@@ -148,9 +148,9 @@ Automated outputs include:
 - KPI summary tables
 
 All charts are exported for:
-- Reports
-- Slides
-- Dashboard-style presentation :contentReference[oaicite:4]{index=4}
+- charts
+
+Dashboard-style presentation:
 
 ---
 
@@ -270,8 +270,7 @@ It can be implemented as:
 
 ## 👨‍💻 Authors
 
-NTU Nanyang Business School  
-BC2407 – Risk Analytics Project
+BC2407 Sem 6 Team 5
 
 ---
 

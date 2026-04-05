@@ -42,12 +42,6 @@ dist/
 *.egg-info/
 
 # ----------------------------
-# Generated project outputs
-# ----------------------------
-outputs/
-outputs/charts/
-
-# ----------------------------
 # Local data files
 # ----------------------------
 data/
@@ -57,3 +51,9 @@ data/
 # ----------------------------
 .env
 .env.*
+
+# Allow outputs but ignore temporary/intermediate files
+outputs/*.tmp
+outputs/*.log
+outputs/*.pkl
+outputs/*.npy

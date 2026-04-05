@@ -150,8 +150,6 @@ Automated outputs include:
 All charts are exported for:
 - charts
 
-Dashboard-style presentation:
-
 ---
 
 ## 📁 Project Structure
@@ -192,7 +190,7 @@ Dependencies include:
 - statsmodels
 - optuna
 - arch
-- yfinance :contentReference[oaicite:5]{index=5}
+- yfinance
 
 ---
 
